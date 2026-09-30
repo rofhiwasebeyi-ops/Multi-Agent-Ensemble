@@ -1,0 +1,57 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Environment variables
+.env
+.env.*
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.lnk
+
+# Datasets
+data/**/*.csv
+data/**/*.xlsx
+data/**/*.xls
+data/**/*.zip
+
+# Trained models
+models/*.pkl
+models/*.pickle
+models/*.joblib
+models/*.h5
+models/*.keras
+models/*.pt
+models/*.pth
+
+# Outputs
+example_run/
+mas_visuals/
+fairness_report.csv
