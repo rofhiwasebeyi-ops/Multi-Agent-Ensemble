@@ -1,4 +1,7 @@
 """Shared scoring/CV-splitting helpers used across agents, fusion, and search.
+
+No dependencies on the rest of this package - this is the leaf module
+everything else (agents, fusion, search, gui, main) imports from.
 """
 import numpy as np
 

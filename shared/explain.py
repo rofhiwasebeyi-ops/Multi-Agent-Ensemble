@@ -8,7 +8,16 @@ import shap
 
 class ExplainabilityEngine:
     """
-    Model-agnostic explainability via SHAP's KernelExplainer.
+    Model-agnostic explainability via SHAP's KernelExplainer. KernelExplainer
+    treats the model as a black box - it only needs a callable that maps
+    X -> P(y=1) - so it works directly against any predictProba function:
+    a single agent, a BaggingEnsemble, or the full MASController (5 agents +
+    fusion layer) without any changes to those classes.
+
+    Because KernelExplainer estimates Shapley values by repeated sampling,
+    it's much slower than a permutation-importance approach - keep
+    background_size and nsamples modest for interactive/GUI use, and raise
+    them for a final report-quality run.
     """
 
     @staticmethod

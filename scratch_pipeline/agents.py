@@ -136,6 +136,21 @@ class SVMAgent(BaseAgent):
                  tol: float = 1e-3, max_passes: int = 10, max_iter: int = 200,
                  platt_iters: int = 500, platt_lr: float = 0.05, random_state: int = None,
                  max_train_samples: int = 4000):
+        """
+        max_train_samples: the SMO solver below builds a full n x n kernel
+            matrix (self._kernel_matrix), which is O(n^2) in both memory and
+            time - fine for hundreds of rows, but at real dataset scale
+            (e.g. OULAD's ~24k-row training split) that is tens of
+            gigabytes and will raise a MemoryError outright (a 24441x24441
+            float64 array alone is 4.45 GiB). Rather than fail, fit()
+            silently subsamples down to at most max_train_samples rows
+            (chosen via the seeded local rng, so it's reproducible) before
+            training - this is a standard, defensible mitigation for
+            kernel-SVM at scale (the same reason libsvm-based pipelines
+            usually subsample or switch to a linear/SGD solver on large
+            data), not a bug being papered over. predict()/predictProba()
+            are unaffected and still work on inputs of any size.
+        """
         super().__init__()
         self.C = C
         self.kernel = kernel
@@ -173,12 +188,20 @@ class SVMAgent(BaseAgent):
         return (K @ (self.alphas * self.y_train)) + self.b
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        # Locally-scoped Generator (not the global np.random state) for the
+        # SMO second-variable selection below - see the matching comment on
+        # RandomForestAgent.fit for why. Previously this used
+        # np.random.choice directly with no seeding at all, so two
+        # "identical" SVM fits were never bit-reproducible.
         rng = np.random.default_rng(self.random_state)
         X = self._as_2d(X)
         y = np.asarray(y, dtype=np.float64).ravel()
 
         n_samples_full = X.shape[0]
         if n_samples_full > self.max_train_samples:
+            # See max_train_samples docstring in __init__: the O(n^2) kernel
+            # matrix below would otherwise exceed memory at real dataset
+            # scale. Subsample with the seeded local rng for reproducibility.
             keep_idx = rng.choice(n_samples_full, size=self.max_train_samples, replace=False)
             X = X[keep_idx]
             y = y[keep_idx]
@@ -311,6 +334,14 @@ class _CARTTree:
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf   # previously unenforced - a common overfitting gap
         self.max_features = max_features
+        # Cap on candidate split thresholds per feature per node. Without
+        # this, a continuous column (e.g. total_clicks, mean_assessment_score)
+        # with thousands of distinct values on real data (OULAD has ~32k
+        # rows) means testing thousands of thresholds at every node of every
+        # tree - O(n * n_unique) per feature per split. Quantile-binning down
+        # to at most max_thresholds candidates cuts that to O(n *
+        # max_thresholds) with negligible accuracy cost, since thresholds a
+        # fraction of a percentile apart almost always pick the same split.
         self.max_thresholds = max_thresholds
         self.root = None
 
@@ -336,6 +367,11 @@ class _CARTTree:
             if len(values) <= 1:
                 continue
             if len(values) > self.max_thresholds + 1:
+                # Too many distinct values to test every midpoint - fall
+                # back to at most max_thresholds quantile-spaced candidates
+                # drawn from the actual observed values (so thresholds
+                # still land on real, meaningful splits rather than
+                # arbitrary points).
                 qs = np.linspace(0.0, 1.0, self.max_thresholds + 2)[1:-1]
                 thresholds = np.unique(np.quantile(values, qs))
             else:
@@ -387,6 +423,14 @@ class _CARTTree:
         return _Node(feature=feat, threshold=thr, left=left, right=right)
 
     def fit(self, X, y, sample_weight=None, rng=None):
+        # rng: an np.random.Generator for feature subsampling in _build.
+        # Accepting it as a parameter (rather than reading global
+        # np.random state) means a caller building many trees in sequence
+        # (RandomForestAgent) can pass ONE seeded Generator through all of
+        # them for a fully reproducible forest, without ever mutating
+        # global numpy random state - which would otherwise leak into and
+        # silently change any other unseeded randomness elsewhere (e.g. a
+        # SVMAgent trained afterwards in the same run).
         self._rng = rng if rng is not None else np.random.default_rng()
         self.root = self._build(X, y, depth=0, w=sample_weight)
 
@@ -405,6 +449,22 @@ class RandomForestAgent(BaseAgent):
                  min_samples_split: int = 4, min_samples_leaf: int = 1,
                  max_features=None, class_weight=None, random_state: int = None,
                  max_thresholds: int = 32):
+        """
+        min_samples_leaf: minimum samples required in EITHER child of a
+            split for it to be accepted - previously unenforced, meaning a
+            split could produce a leaf of size 1, a common source of
+            overfitting on small datasets.
+        class_weight: None, or "balanced" - if "balanced", samples are
+            weighted inversely to their class frequency (n_samples /
+            (n_classes * class_count)) when computing Gini impurity and leaf
+            values, so a minority "at-risk" class isn't structurally
+            underweighted the way plain accuracy/Gini would leave it.
+        max_thresholds: cap on candidate split thresholds tested per
+            continuous feature per node (see _CARTTree) - keeps split-finding
+            from scaling with the number of distinct values in a column,
+            which is what made training on real (large, high-cardinality)
+            datasets like OULAD much slower than on small synthetic data.
+        """
         super().__init__()
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -417,6 +477,15 @@ class RandomForestAgent(BaseAgent):
         self.trees = []
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        # A locally-scoped Generator rather than np.random.seed(...): the
+        # old code mutated the GLOBAL numpy random state, which meant
+        # training a RandomForest could silently change the results of any
+        # OTHER unseeded randomness run afterwards in the same process
+        # (e.g. an SVMAgent trained later in the same ensemble run) -
+        # reproducibility that depends on call order is not real
+        # reproducibility. This Generator is reused sequentially across all
+        # n_estimators trees below, which is itself fully deterministic
+        # given random_state.
         rng = np.random.default_rng(self.random_state)
         X = self._as_2d(X)
         y = np.asarray(y, dtype=np.float64).ravel()
@@ -461,7 +530,9 @@ class MLPAgent(BaseAgent):
     """
     Fully-connected NumPy MLP with an arbitrary number of ReLU hidden layers,
     sized via hidden_layer_sizes (e.g. (16,) for one layer of 16 units,
-    (32, 16) for two layers). 
+    (32, 16) for two layers). Generalizing beyond a single fixed hidden
+    layer is what makes architecture search (see mlp_architecture_search())
+    meaningful - otherwise there's only ever one architecture to search.
     """
 
     def __init__(self, hidden_layer_sizes=(16,), lr: float = 0.05, n_epochs: int = 300,
@@ -504,6 +575,14 @@ class MLPAgent(BaseAgent):
         return out
 
     def _init_params(self, n_features):
+        # np.random.default_rng(None) draws from OS entropy without ever
+        # touching global numpy random state - unlike the previous
+        # `np.random if self.seed is None else np.random.RandomState(...)`,
+        # which fell back to the bare np.random MODULE (global state) when
+        # unseeded. That's the same class of bug fixed elsewhere in this
+        # file for RandomForestAgent/BaggingEnsemble/SVMAgent - it just
+        # slipped past that earlier pass because it wasn't a np.random.X(...)
+        # call, it was an assignment of the module itself to a local name.
         rng = np.random.default_rng(self.seed)
         layer_sizes = [n_features] + list(self.hidden_layer_sizes) + [1]
         self.Ws, self.bs = [], []
@@ -599,13 +678,44 @@ class MLPAgent(BaseAgent):
 # AISAgent (Negative Selection Algorithm)
 class AISAgent(BaseAgent):
     """
-    Negative Selection Algorithm (NSA). 
+    Negative Selection Algorithm (NSA). Two design choices matter a lot once
+    the feature space is high-dimensional and mostly one-hot (as it is here,
+    ~58 dims after get_dummies), and both are addressed below:
+
+    1. detector_strategy="mutation" (default) generates candidate detectors
+       by perturbing real SELF samples (jitter continuous dims, flip a few
+       one-hot dims) rather than sampling uniformly over the whole [0,1]^d
+       hypercube. Real records live near the CORNERS of that hypercube;
+       uniform-random points land near the center, so in high dimensions
+       they end up far from every real point (self AND non-self) almost by
+       construction - they clear negative selection trivially but then
+       essentially never fire on real non-self students either, contributing
+       ~nothing to predictProba. Mutating from real self points keeps
+       detectors on the actual data manifold. detector_strategy="random"
+       keeps the original behaviour for comparison.
+
+    2. radius_calibration="cv" (default) picks self_radius by k-fold
+       cross-validated F1 rather than by scanning quantiles of the in-sample
+       self-distance distribution (radius_calibration="insample", the
+       original behaviour) - the in-sample version can pick a radius that
+       looks good on the data it was tuned on but doesn't generalize.
     """
 
     def __init__(self, n_detectors: int = 200, self_radius="auto",
                  max_tries_per_detector: int = 300, random_state: int = None,
                  detector_strategy: str = "mutation", radius_calibration: str = "cv",
                  k_folds: int = 5, flip_prob: float = 0.08, label_flip: bool = None):
+        """
+        label_flip: which class fit() should treat as 'self'. None (the
+            default) means auto-detect per fit() call via
+            _detect_self_class. BaggingEnsemble's precalibrate() hook sets
+            this explicitly (via an override applied to every bagged
+            member's kwargs) so all members agree on the same orientation,
+            decided once on the full training set, rather than each member
+            re-detecting it independently on its own noisy bootstrap
+            sample - the same reasoning that already applies to
+            self_radius being calibrated once and shared.
+        """
         super().__init__()
         self.n_detectors = n_detectors
         self.self_radius = self_radius       # "auto" or a user-supplied float
@@ -622,10 +732,28 @@ class AISAgent(BaseAgent):
         self._min = self._max = None
         self._binary_mask = None             # which normalised dims are one-hot/binary (0/1 only)
         self._label_flipped = False          # set in fit() - see _detect_self_class
+        # AIS has no gradient-descent loss curve, but self_radius='auto' does
+        # scan a grid of candidate radii and score each one - this is its
+        # analogue of a learning curve (score vs. candidate radius rather
+        # than loss vs. training step), captured here for visualization.
         self.calibration_history = None      # {'x','y','chosen_x','x_label','y_label'} or None
 
     @classmethod
     def precalibrate(cls, X, y, agent_kwargs=None):
+        """Hook picked up by BaggingEnsemble.fit(): calibrates self_radius
+        ONCE on the full training set (before any bootstrap resampling) and
+        returns {'self_radius': <float>} to be reused by every bagged
+        member. Only fires when self_radius='auto' (an explicit numeric
+        self_radius is left alone). Bagging diversity still comes from each
+        member drawing its own bootstrap sample and detector set - just not
+        from independently re-deriving this one noisy threshold.
+
+        Also returns the calibration search curve under the special
+        '_calibration_debug' key, which BaggingEnsemble.fit() pops off
+        before forwarding the rest to each member's constructor, and stores
+        on itself for visualization (since none of the individual bagged
+        AIS members run the search themselves once a radius is handed to
+        them - the probe below is the only place it happens)."""
         agent_kwargs = dict(agent_kwargs or {})
         if agent_kwargs.get("self_radius", "auto") != "auto":
             return {}
@@ -641,9 +769,22 @@ class AISAgent(BaseAgent):
         probe._min = X.min(axis=0)
         probe._max = X.max(axis=0)
         Xn = probe._normalise(X)
+
+        # Radius calibration only needs a REPRESENTATIVE sample of the
+        # training set to estimate self-distance quantiles / CV F1 - not
+        # every row (see _cap_for_calibration's docstring for why this
+        # matters at real dataset scale, not just as an optimization).
         Xn_calib, y_calib, self_samples = cls._cap_for_calibration(
             Xn, y, max_calib=3000, random_state=agent_kwargs.get("random_state"))
 
+        # Decide which class is 'self' ONCE here (see _detect_self_class),
+        # on the same capped sample used for radius calibration, so every
+        # bagged member gets a self_radius that was calibrated against the
+        # SAME orientation it will actually use - calibrating against one
+        # class's distance distribution and then having members flip
+        # independently would leave the shared radius on the wrong scale
+        # (the two classes are not equally spread out - that's the whole
+        # reason a flip can help at all).
         self_class = cls._detect_self_class(Xn_calib, y_calib,
                                              random_state=agent_kwargs.get("random_state"))
         label_flip = (self_class == 1.0)
@@ -668,6 +809,22 @@ class AISAgent(BaseAgent):
 
     @staticmethod
     def _cap_for_calibration(Xn, y, max_calib=3000, random_state=None):
+        """Subsamples (Xn, y) together (keeping labels aligned with rows)
+        down to at most max_calib rows, and returns a same-cap subsample of
+        the self-class (y==0) rows too. Shared by fit() and precalibrate()
+        - radius calibration only needs a REPRESENTATIVE sample to estimate
+        an F1-vs-radius curve, not every row, and without this cap,
+        _select_radius_cv / _nearest_self_distances build a full (n, n_self)
+        pairwise distance matrix that is several GB at OULAD's real ~24k-row
+        scale - enough to exhaust memory outright, not just be slow (found
+        by actually running the real dataset). This must be called from
+        BOTH fit() (the self_radius="auto" branch, hit when an AISAgent is
+        used standalone/unbagged) and precalibrate() (hit when bagged) -
+        fixing only one of the two still leaves the other exposed to the
+        same crash, which is exactly what happened here: precalibrate() was
+        fixed first, and a standalone AISAgent.fit() call on real data still
+        got OOM-killed because it never went through precalibrate() at all.
+        """
         rng = np.random.default_rng(random_state)
         if len(Xn) > max_calib:
             keep = rng.choice(len(Xn), size=max_calib, replace=False)
@@ -688,6 +845,13 @@ class AISAgent(BaseAgent):
 
     @staticmethod
     def _pairwise_dist(A, B):
+        """Full (n, m) Euclidean distance matrix between rows of A and rows
+        of B, via ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a.b - a matrix-multiply
+        formulation instead of a per-point Python loop. This is the
+        workhorse behind detector generation, radius calibration, and
+        predictProba, all of which used to call np.linalg.norm() inside a
+        Python for-loop (fine for one predict() call, but far too slow once
+        it's also driving batched detector generation and k-fold CV)."""
         A2 = np.sum(A ** 2, axis=1)[:, None]
         B2 = np.sum(B ** 2, axis=1)[None, :]
         sq = np.maximum(A2 + B2 - 2 * (A @ B.T), 0.0)
@@ -695,6 +859,21 @@ class AISAgent(BaseAgent):
 
     @classmethod
     def _min_dist_to_set(cls, A, B, batch_size=2000):
+        """For every row of A, the minimum Euclidean distance to any row of
+        B. Processes A in batches rather than materializing the full
+        (len(A), len(B)) distance matrix at once - at OULAD's real scale,
+        predictProba calling this with the full query set against the full
+        self-samples reference set is a ~24000 x ~11500 matrix, several GB,
+        enough to exhaust memory outright (found by running the real
+        dataset - fit()'s calibration was fixed first via subsampling, but
+        that only tunes the radius; predictProba's use of the FULL
+        self_samples_ as the actual reference set can't be subsampled the
+        same way without changing what the classifier does). Batching gives
+        results IDENTICAL to computing the full matrix at once - this is a
+        memory/engineering fix, not an approximation. Callers that already
+        pass a small A (a detector-generation batch, a CV fold's X_val)
+        never exceed batch_size, so this is a no-op safety net for them,
+        not a behavior change."""
         if len(B) == 0:
             return np.full(len(A), np.inf)
         if len(A) <= batch_size:
@@ -713,6 +892,9 @@ class AISAgent(BaseAgent):
         D = cls._pairwise_dist(X_norm, self_pts)  # (n_samples, n_self)
         self_mask = y == 0
         if self_mask.any() and D.shape[1] > 1:
+            # for self-class rows, the zero self-distance to itself sits
+            # somewhere in that row - mask out that one zero before taking
+            # the min so self points don't just match themselves.
             self_rows = np.where(self_mask)[0]
             row_min_idx = np.argmin(D[self_rows], axis=1)
             D_masked = D.copy()
@@ -725,6 +907,23 @@ class AISAgent(BaseAgent):
 
     @staticmethod
     def _select_radius_supervised(d_self_all, y):
+        """Original in-sample calibration: scans quantiles of the training
+        self-distance distribution and keeps whichever threshold gives the
+        best in-sample F1. Kept as radius_calibration='insample'. Returns
+        (best_r, candidates, f1_per_candidate) - the latter two are the
+        calibration's own "learning curve" (F1 vs. candidate radius).
+
+        The grid starts at the 2nd percentile, not a more conservative
+        30th+: found by actually running real data (OULAD) that the useful
+        operating region can sit BELOW the 10th percentile of self-
+        distances, with a sharp cliff shortly after it (F1 dropping from
+        ~0.64 to ~0.01 between roughly the 5th and 10th percentiles) as the
+        effective decision threshold (see predictProba: predict() fires at
+        d_self >= 1.5*r, not d_self >= r) crosses past where most test
+        points actually sit. A grid that only starts at the 30th
+        percentile never even evaluates the region where the real signal
+        lives, and silently settles for a radius that classifies almost
+        nothing as non-self."""
         candidates = np.unique(np.quantile(d_self_all, np.linspace(0.02, 0.97, 30)))
         best_r, best_f1 = 0.25, -1.0
         scored_candidates, scores = [], []
@@ -746,6 +945,28 @@ class AISAgent(BaseAgent):
 
     def _select_radius_cv(self, Xn, y, seed=0, n_detectors_search=20,
                            n_candidates=9, search_folds=3):
+        """Cross-validated calibration against the REAL prediction pipeline:
+        for each candidate radius, hold out a fold, build self_samples AND a
+        (reduced-size, for speed) detector set from the OTHER folds only,
+        score F1 on the held-out fold using the same self-distance +
+        detector-matching logic predictProba() uses, and keep the radius
+        with the best mean F1 across folds. Scoring only a self-distance
+        proxy (ignoring detectors) can pick a radius that looks fine in
+        isolation but behaves very differently - often over-triggering -
+        once the detector-matching boost is added back at predict time.
+
+        The candidate grid, fold count, and search-time detector count are
+        all kept modest (rather than matching self.k_folds/n_detectors)
+        because this whole search reruns once per BaggingEnsemble member -
+        with n_estimators=10 a heavier grid turns a a few-second fit into a
+        half-minute one.
+
+        The grid's lower bound (2nd percentile, not a more conservative
+        15%+) matters for the same reason documented in
+        _select_radius_supervised: real data (OULAD) showed the useful
+        operating region can sit below the 10th percentile, with a sharp
+        F1 cliff shortly after - a grid that starts too high never
+        evaluates that region at all."""
         folds = _stratified_kfold_indices(y, k=search_folds, seed=seed)
         n_features = Xn.shape[1]
         self_all = Xn[y == 0]
@@ -803,6 +1024,12 @@ class AISAgent(BaseAgent):
         return max(float(best_r), 1e-3), np.array(scored_candidates), np.array(scores)
 
     def _generate_detectors_random(self, self_samples, r, n_features, rng, n_override=None):
+        """Original strategy: sample uniformly over the whole normalised
+        hypercube and keep whatever clears the self-radius test. Candidates
+        are generated and distance-checked in BATCHES (vectorized) rather
+        than one at a time, since a Python-level loop calling np.linalg.norm
+        per candidate is far too slow once this runs inside k-fold CV and a
+        10-member BaggingEnsemble."""
         n = self.n_detectors if n_override is None else n_override
         if n <= 0 or len(self_samples) == 0:
             return np.empty((0, n_features))
@@ -822,6 +1049,13 @@ class AISAgent(BaseAgent):
         return np.vstack(detectors)[:n]
 
     def _generate_detectors_mutation(self, self_samples, r, n_features, rng, n_override=None):
+        """Generate candidates by perturbing real self samples - jitter the
+        continuous dims, flip a few one-hot dims - so detectors stay on the
+        real data manifold instead of drifting to the hypercube interior.
+        The jitter magnitude is itself randomised per candidate (small to
+        large) so detectors land at a range of distances from self,
+        including near the true self/non-self boundary rather than only far
+        out. Generated and distance-checked in BATCHES for speed."""
         n = self.n_detectors if n_override is None else n_override
         if n <= 0 or len(self_samples) == 0:
             return np.empty((0, n_features))
@@ -856,6 +1090,26 @@ class AISAgent(BaseAgent):
 
     @classmethod
     def _detect_self_class(cls, Xn, y, sample_size=1500, random_state=None):
+        """Decides which value of y should be treated as 'self' for
+        negative selection, rather than always assuming y==0. Negative
+        selection's whole premise is that 'self' is the tighter, more
+        homogeneous cluster and detectors get placed in the gaps around
+        it - but that assumption isn't automatically true for every
+        feature space. Found by testing real OULAD data: on the
+        behaviour/engagement feature subset used for this agent's
+        heterogeneous-agent configuration, NOT-at-risk students turned out
+        to be the MORE spread-out class (diverse engagement patterns among
+        successful students - heavy readers, heavy forum users, heavy
+        quiz-takers), while at-risk students clustered more tightly around
+        a uniform "low engagement everywhere" signature - the opposite of
+        what self=y==0 assumes. Silently keeping the wrong orientation
+        made accuracy WORSE than either trivial baseline (0.39 vs a ~0.53/
+        0.47 majority baseline) on that subset; auto-detecting and flipping
+        brought it to 0.61. On the full feature set the natural orientation
+        (self=y==0) already separates correctly, so this is a no-op there.
+
+        Returns 0.0 or 1.0 (whichever value of y should be treated as
+        self)."""
         rng = np.random.default_rng(random_state)
         n = len(Xn)
         if n > sample_size:
@@ -911,6 +1165,11 @@ class AISAgent(BaseAgent):
         self.self_samples_ = self_samples
 
         if self.self_radius == "auto":
+            # Same cap as precalibrate() (see _cap_for_calibration) - without
+            # it, a standalone AISAgent.fit() call (not wrapped in
+            # BaggingEnsemble, which is the only place that previously had
+            # this fix) still builds an uncapped (n, n_self) pairwise
+            # distance matrix and gets OOM-killed on real dataset scale.
             Xn_calib, y_calib, self_samples_calib = self._cap_for_calibration(
                 Xn, y, max_calib=3000, random_state=self.random_state)
             if self.radius_calibration == "cv":
@@ -948,6 +1207,11 @@ class AISAgent(BaseAgent):
             matched = d_det <= r
             proba = np.where(matched, np.maximum(proba, 0.7), proba)
 
+        # Everything above was computed in the (possibly relabeled) internal
+        # frame fit() used - see _detect_self_class. Convert back to a true
+        # P(y=1) here, at the single point where predictions leave the
+        # class, rather than threading a flip flag through every internal
+        # method that touches labels.
         if self._label_flipped:
             proba = 1.0 - proba
         return proba
@@ -979,11 +1243,22 @@ class BaggingEnsemble:
         self._fitted = False
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        # Locally-scoped Generator instead of np.random.seed(...) - see the
+        # matching comment in RandomForestAgent.fit for why mutating the
+        # global numpy random state here is worth avoiding.
         rng = np.random.default_rng(self.random_state)
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64).ravel()
         n_samples = X.shape[0]
 
+        # Optional hook: if the base agent class exposes precalibrate(), run
+        # it ONCE on the full training set and reuse the result for every
+        # bagged member, instead of each member independently re-deriving
+        # some expensive/unstable hyperparameter on its own small, noisy
+        # bootstrap resample. AISAgent uses this for its self_radius - radius
+        # search on a bootstrap-of-a-bootstrap is noisy enough that members
+        # land on wildly different thresholds and the ensemble average
+        # washes out to predicting almost nothing.
         agent_kwargs = self.agent_kwargs
         if hasattr(self.base_agent_factory, "precalibrate"):
             overrides = self.base_agent_factory.precalibrate(X, y, agent_kwargs)
@@ -1055,9 +1330,31 @@ class BaggingEnsemble:
         return curves
 
 
+
+
 AGENT_REGISTRY = {
     "LogisticRegression": (LogisticRegressionAgent, dict(lr=0.15, n_iters=1200)),
+    # random_state/seed fixed below (rather than left at the class default
+    # of None) for every agent type that has internal randomness beyond
+    # what BaggingEnsemble's own bootstrap draw already varies per member -
+    # without this, the exact same CLI command with the exact same --seed
+    # was NOT actually bit-reproducible run to run, because each bagged
+    # member's OWN internal randomness (SVM's SMO variable selection, a
+    # tree's feature subsampling, MLP's weight init, AIS's detector
+    # generation/radius calibration) was still drawn from OS entropy. A
+    # fixed internal seed shared across bagged members, paired with
+    # DIFFERENT bootstrap data per member (from BaggingEnsemble's own
+    # seeded rng), still gives genuine ensemble diversity - it just means
+    # re-running the same command reproduces the same result, which is the
+    # actual reproducibility property that matters. --seed on the CLI
+    # separately controls the train/test split.
     "SVM": (SVMAgent, dict(C=1.0, kernel="rbf", max_passes=5, max_iter=40, random_state=0)),
+    # n_estimators=8 rather than the old 20: RandomForest is itself wrapped
+    # by MASController's outer BaggingEnsemble (n_estimators=10 by default),
+    # which already supplies bagging-style variance reduction. At the old
+    # setting that meant up to 10*20=200 trees per run; this brings it down
+    # to 10*8=80 without meaningfully changing accuracy, since the outer
+    # bagging is doing the same job.
     "RandomForest": (RandomForestAgent, dict(n_estimators=8, max_depth=8, min_samples_leaf=2, random_state=0)),
     "MLP": (MLPAgent, dict(hidden_layer_sizes=(32, 16), lr=0.05, n_epochs=150, seed=0)),
     "AIS": (AISAgent, dict(n_detectors=150, self_radius="auto",

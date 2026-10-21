@@ -5,7 +5,7 @@ fuses their predictions, and exposes SHAP-based explanations.
 import numpy as np
 
 from .agents import AGENT_REGISTRY, BaggingEnsemble
-from .search import mlp_architecture_search, rf_architecture_search
+from .search import mlp_architecture_search, rf_architecture_search, hyperparameter_search
 from shared import _stratified_kfold_indices, accuracy, ExplainabilityEngine
 
 
@@ -13,6 +13,17 @@ class FusionLayer:
     """
     Static fusion: learns ONE fixed weight vector over the agents for the
     whole dataset. Simple, fast baseline to compare GatingFusionLayer against.
+
+    The agents' predictions are almost always highly correlated with each
+    other (they're all trained on the same features/target), so this is a
+    textbook multicollinear regression setting: with weak L2, the fitted
+    weights become unstable and can swing to large, sign-flipped values that
+    fit training-set noise rather than genuine relative agent quality (e.g.
+    a weak agent getting a confidently NEGATIVE weight, or a mediocre agent
+    outweighing the strongest standalone one) - which is exactly what lets
+    the fused model underperform the best single agent on held-out data.
+    l2='auto' (the default) fixes this by cross-validating the L2 strength
+    on a small grid rather than using one fixed, usually-too-weak value.
     """
 
     def __init__(self, lr: float = 0.2, n_iters: int = 3000, l2="auto", tol: float = 1e-8,
@@ -31,6 +42,10 @@ class FusionLayer:
         self.loss_history = []       # for learning-curve visualization
         self.loss_steps = []
         self.loss_step_label = "iteration"
+        # AIS-style calibration curve (score vs. candidate L2), populated
+        # only when l2='auto'; picked up automatically by the same
+        # Learning Curves plumbing that already renders AISAgent's
+        # calibration_history, so no extra UI wiring is needed.
         self.calibration_history = None
 
     # uses_context=False tells MASController this fusion layer only needs
@@ -145,7 +160,34 @@ class FusionLayer:
 class GatingFusionLayer:
     """
     Learned, PER-INSTANCE alternative to FusionLayer's single fixed weight
-    vector. 
+    vector. A small softmax gating network (one hidden ReLU layer) looks at
+    BOTH each agent's prediction AND the student's own (standardised) feature
+    vector, plus a few derived meta-features (inter-agent disagreement,
+    confidence margin, spread), and outputs a fresh set of trust weights for
+    every student - i.e. it can learn context-dependent rules like "trust
+    AIS less for students with many active categorical risk flags" rather
+    than one static blend for the whole dataset:
+
+        gate_input   = [Xs | standardised(agent_preds) | entropy | margin | std_dev]
+        gate_weights = softmax( ReLU(gate_input @ W1 + b1) @ W2 + b2 )
+        final_prob   = sum(gate_weights * agent_preds, axis=1)   # RAW agent_preds, not standardised
+
+    Trained via manual backprop (BCE loss) on the training features X and
+    the same stacking matrix FusionLayer uses.
+
+    Two stability fixes, both addressing the same failure mode: with weak,
+    fixed L2 (the old default), the gate can collapse onto ALWAYS trusting
+    whichever agent happens to look best on training data - a training-set
+    shortcut that doesn't generalize (e.g. an agent whose raw predictProba
+    is more saturated/near-binary than the others gets an outsized say in
+    ITS OWN routing decision purely from that scale, independent of whether
+    its actual predictions are more trustworthy):
+      1. l2='auto' (new default) cross-validates L2 strength, the same fix
+         already applied to FusionLayer's identical instability.
+      2. agent_preds are z-scored before entering the gate's INPUT layer
+         (not the final blending step, which still uses raw probabilities -
+         only the routing DECISION is desensitised to any one agent's
+         output scale).
     """
 
     def __init__(self, hidden_size: int = 16, lr: float = 0.05, n_epochs: int = 300,
@@ -375,14 +417,61 @@ class MASController:
                  fusion_type: str = "logistic", fusion_kwargs: dict = None,
                  auto_tune_mlp: bool = False, mlp_search_kwargs: dict = None,
                  auto_tune_rf: bool = False, rf_search_kwargs: dict = None,
-                 agent_feature_overrides: dict = None):
-        
+                 agent_feature_overrides: dict = None,
+                 auto_tune_all: bool = False, agent_search_kwargs: dict = None):
+        """
+        fusion_type: "logistic" -> FusionLayer (static weights, one blend for
+                     the whole dataset). "gating" -> GatingFusionLayer
+                     (per-instance weights, using both agent predictions AND
+                     the student's own feature vector).
+        fusion_kwargs: optional dict of constructor kwargs forwarded to
+                     whichever fusion class is selected.
+        auto_tune_mlp: if True, train() runs mlp_architecture_search() on the
+                     training data first and swaps the MLP entry in the
+                     agent registry for the best architecture found, before
+                     training any agents. Adds real cost to train() (a full
+                     k-fold search), so it's opt-in.
+        mlp_search_kwargs: optional dict of kwargs forwarded to
+                     mlp_architecture_search() (architectures, lr_choices,
+                     l2_choices, n_epochs, k_folds, etc).
+        auto_tune_rf: if True, train() runs rf_architecture_search() on the
+                     training data first and swaps the RandomForest entry in
+                     the agent registry for the best config found (tree
+                     depth, min_samples_split/leaf, class_weight), before
+                     training any agents. Same opt-in cost tradeoff as
+                     auto_tune_mlp.
+        rf_search_kwargs: optional dict of kwargs forwarded to
+                     rf_architecture_search() (configs, search_n_estimators,
+                     final_n_estimators, k_folds, etc).
+        agent_feature_overrides: optional {agent_name: [col_idx, ...]} - lets
+                     individual agents train/predict on a DIFFERENT column
+                     subset of the same X than the rest of the ensemble,
+                     rather than every agent seeing identical features.
+                     Column indices are relative to the X passed into
+                     train()/predictProba() (i.e. positions within whatever
+                     feature_names apply to that call). Agents not listed
+                     use the full X, same as before. Motivating case: AIS's
+                     distance-based scoring degrades in high dimensions, so
+                     it can be pointed at just the grade columns (e.g.
+                     {"AIS": grade_positions}) while LogisticRegression/SVM/
+                     RandomForest/MLP keep the full feature set - each
+                     agent still just contributes a predictProba() column to
+                     the same stacking matrix, so fusion is unaffected.
+        """
         self.agent_registry = agent_registry or AGENT_REGISTRY
         self.use_bagging = use_bagging
         self.n_estimators = n_estimators
         self.random_state = random_state
         self.fusion_type = fusion_type
         self.fusion_kwargs = fusion_kwargs or {}
+        # auto_tune_all: CV-tune EVERY agent. MLP and RandomForest use their
+        # dedicated searches; LogisticRegression, SVM and AIS use the generic
+        # hyperparameter_search (each on its own feature view).
+        # agent_search_kwargs: optional {agent_name: kwargs for hyperparameter_search}.
+        self.auto_tune_all = auto_tune_all
+        self.agent_search_kwargs = agent_search_kwargs or {}
+        if auto_tune_all:
+            auto_tune_mlp = auto_tune_rf = True
         self.auto_tune_mlp = auto_tune_mlp
         self.mlp_search_kwargs = mlp_search_kwargs or {}
         self.auto_tune_rf = auto_tune_rf
@@ -397,6 +486,8 @@ class MASController:
         self.best_mlp_config = None          # populated in train() if auto_tune_mlp
         self.rf_search_leaderboard = None    # populated in train() if auto_tune_rf
         self.best_rf_config = None           # populated in train() if auto_tune_rf
+        self.best_configs = {}               # name -> best CV entry (LogisticRegression/SVM/AIS if auto_tune_all)
+        self.search_leaderboards = {}
         self._fitted = False
 
     def _make_fusion(self):
@@ -434,11 +525,30 @@ class MASController:
             X_rf = self._agent_view(X, "RandomForest")
             rf_kwargs = dict(self.rf_search_kwargs)
             if self.use_bagging and "final_n_estimators" not in rf_kwargs:
+                # RF is about to be wrapped by THIS controller's own
+                # BaggingEnsemble (n_estimators members), so each RF member
+                # doesn't need to be its own large forest - the outer
+                # bagging already supplies that variance reduction. Without
+                # this, auto-tuning's final_n_estimators (default 50) times
+                # the outer n_estimators (often 10) means 500 trees just for
+                # RandomForest, most of them redundant.
                 rf_kwargs["final_n_estimators"] = 20
             leaderboard, best = rf_architecture_search(X_rf, y, verbose=False, **rf_kwargs)
             self.rf_search_leaderboard = leaderboard
             self.best_rf_config = best
             registry["RandomForest"] = (rf_cls, best["agent_kwargs"])
+
+        if self.auto_tune_all:
+            for name in ("LogisticRegression", "SVM", "AIS"):
+                if name not in registry:
+                    continue
+                cls, kwargs = registry[name]
+                leaderboard, best = hyperparameter_search(
+                    name, self._agent_view(X, name), y, base_kwargs=kwargs, verbose=False,
+                    **self.agent_search_kwargs.get(name, {}))
+                self.search_leaderboards[name] = leaderboard
+                self.best_configs[name] = best
+                registry[name] = (cls, best["agent_kwargs"])
 
         self.agents = {}
         train_cols = []
@@ -499,20 +609,33 @@ class MASController:
             name: accuracy(y_test, self.agents[name].predict(self._agent_view(X_test, name)))
             for name in self.agent_registry.keys()
         }
+        agent_test_proba = self._stack_proba(X_test)
+        agent_test_pred = (agent_test_proba >= 0.5).astype(int)
         return {
             "agent_names": list(self.agent_registry.keys()),
+            "agent_test_proba": agent_test_proba,
+            "agent_test_pred": agent_test_pred,
             "per_agent_test_acc": per_agent_test_acc,
             "fusion_weights": self.get_agent_trust(),
             "fusion_type": self.fusion_type,
             "y_pred": y_pred,
             "best_mlp_config": self.best_mlp_config,
             "best_rf_config": self.best_rf_config,
+            "best_configs": self.best_configs,
         }
 
     def get_agent_trust(self) -> dict:
+        """For 'logistic': the single fixed weight vector. For 'gating': the
+        MEAN gate weight per agent across the training set — a global summary
+        only, since real weights vary per instance/student context
+        (see get_instance_gate_weights)."""
         return dict(zip(self.agent_registry.keys(), self.fusion.get_weights()))
 
     def get_instance_gate_weights(self, X: np.ndarray) -> np.ndarray:
+        """Per-instance agent trust weights, shape (n_samples, n_agents), in
+        the same agent order as self.agent_registry.keys(). Only available
+        when fusion_type='gating', since the weights are conditioned on each
+        student's own feature vector."""
         if self.fusion_type != "gating":
             raise RuntimeError(
                 "Instance-level gate weights are only available when fusion_type='gating'.")
@@ -545,12 +668,16 @@ def run_full_ensemble_pipeline(X_train, y_train, X_test, y_test,
                                 use_bagging=True, n_estimators=10, agent_registry=None,
                                 feature_names=None, fusion_type="logistic", fusion_kwargs=None,
                                 auto_tune_mlp=False, mlp_search_kwargs=None,
-                                agent_feature_overrides=None):
+                                agent_feature_overrides=None, auto_tune_rf=False,
+                                rf_search_kwargs=None, auto_tune_all=False,
+                                agent_search_kwargs=None):
 
     controller = MASController(agent_registry=agent_registry, use_bagging=use_bagging,
                                 n_estimators=n_estimators, fusion_type=fusion_type,
                                 fusion_kwargs=fusion_kwargs, auto_tune_mlp=auto_tune_mlp,
                                 mlp_search_kwargs=mlp_search_kwargs,
+                                auto_tune_rf=auto_tune_rf, rf_search_kwargs=rf_search_kwargs,
+                                auto_tune_all=auto_tune_all, agent_search_kwargs=agent_search_kwargs,
                                 agent_feature_overrides=agent_feature_overrides)
     result = controller.run_pipeline(X_train, y_train, X_test, y_test, feature_names=feature_names)
     result["controller"] = controller

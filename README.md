@@ -160,3 +160,48 @@ pandas-3.0 string-dtype issue that once broke OULAD loading silently).
 Good accuracy on one dataset is weak evidence a from-scratch
 implementation is correct; failing one of these checks is strong evidence
 it isn't.
+
+## Results panel, agreement metrics and model visualisations
+
+**Results tabs (GUI).** Results are laid out as cards, coloured tables and bars rather than text:
+*Overview* (plain-language verdict, metric cards, a colour-coded confusion matrix, key findings and how the
+run was configured), *Models* (per-agent accuracy and fusion-weight bars, gate spread, tuned settings),
+*Agreement* (grouped measures with explanations and heat-shaded agreement/kappa matrices), *Fairness*
+(severity-rated overview, then group-by-group bars, worst attribute first), *Explain* (SHAP story and tables),
+*Tuning* (MLP/RandomForest search leaderboard with the winner highlighted) and *Log* (raw status messages).
+A status bar with a busy indicator shows what a background job is doing, and the settings panel collapses
+automatically after a run (button at top right) so the results get more room.
+Export Report writes a clean plain-text version of all tabs (`shared/report.text_report`).
+The widgets live in `gui_widgets.py`; the Tk-free view data in `shared/report.py`.
+
+**Agreement / diversity metrics** (`shared/agreement.py`, also written to
+`manifest.json` under `agreement` and printed by the CLI): pairwise agreement,
+Cohen's kappa, Fleiss' kappa, disagreement, double-fault, Q-statistic,
+probability correlation, unanimous rate and accuracy, accuracy on split votes,
+majority-vote and oracle accuracy, share misclassified by every agent, fusion-vs-agent
+agreement, and how many students fusion rescued/broke relative to the best single
+agent. Gating runs also report the per-agent gate weight standard deviation.
+
+**Model visualisations** (`shared/visuals.py`): *Visualize Models* draws the
+trained MLP as a layer/neuron diagram (edge colour = weight sign, width = |weight|),
+a random-forest overview (leaves per tree, most-used split features) and the first
+three trees. *MLP/RandomForest Architecture Search* now also trains the winning
+configuration and draws it. Every chart is auto-saved as a PNG.
+
+**Chart gallery and explainability.** Every chart from the current run is kept in a
+gallery above the chart pane: use Prev/Next or the drop-down to browse them (a new
+analysis starts a new gallery; PNGs are always kept in the session folder). The
+*Explain* tab turns SHAP output into a plain-language summary plus tables:
+overall drivers, why one student got their prediction, and which agents the gate trusted.
+
+## Tuning every agent
+
+`--auto-tune-all` (CLI) or the "Auto-tune ALL agents" checkbox (GUI) CV-tunes each agent before training.
+- **From-scratch pipeline:** MLP and RandomForest use their dedicated searches; LogisticRegression
+  (learning rate, L2), SVM (kernel, C) and AIS (detector count, mutation rate) use
+  `scratch_pipeline.hyperparameter_search`, each on its own feature view. SVM and AIS search on a
+  row subsample (they are O(n^2)); the final models are still trained normally.
+- **scikit-learn pipeline:** `GridSearchCV` per library model (`tune_sklearn_agents`); AIS reuses the
+  from-scratch search. Chosen settings are reported in the results, printed by the CLI and written to
+  `manifest.json` under `tuned_configs`.
+- Opt-in because it adds roughly a minute on OULAD-sized data (more with larger grids).

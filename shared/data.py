@@ -1,13 +1,15 @@
 """Dataset loading and preprocessing: raw OULAD (zip or extracted folder)
 and UCI Student Performance, plus group-aware/plain train-test splitting,
 a fairness diagnostics report, and a synthetic demo dataset generator.
+
+No dependencies on the rest of this package.
 """
 import numpy as np
 import pandas as pd
 
 
 def _read_oulad_member(zip_path, member, **kwargs):
-    """Read one CSV from an OULAD folder"""
+    """Read one CSV from an OULAD zip archive."""
     import zipfile
     with zipfile.ZipFile(zip_path) as z:
         names = z.namelist()
@@ -32,6 +34,13 @@ def _find_oulad_file(directory, filename):
 
 def _build_oulad_features(source_path, early_days=28, chunksize=250000):
     """Build one row per student/module/presentation from raw OULAD.
+
+    The target is final_result: Fail/Withdrawn -> 1 (at risk),
+    Pass/Distinction -> 0. Only information available during the first
+    `early_days` days is used for assessment/VLE activity. date_unregistration
+    and final_result are never used as predictors.
+
+    Accepts either the original OULAD zip or an extracted OULAD directory.
     """
     import os
     import zipfile
@@ -217,7 +226,11 @@ def _build_oulad_features(source_path, early_days=28, chunksize=250000):
 def _validate_oulad_schema(source_path):
     """Checks that each required OULAD CSV has the columns
     _build_oulad_features actually needs, BEFORE any of the merging/
-    aggregation logic runs."""
+    aggregation logic runs. Without this, a wrong-schema or hand-edited
+    CSV fails deep inside a pandas merge/groupby with a bare KeyError or
+    ValueError that doesn't say which file or column is at fault - this
+    collects every problem across every file into one clear message
+    instead of a fail-fix-rerun cycle one column at a time."""
     required_columns = {
         "studentInfo.csv": ["id_student", "code_module", "code_presentation", "final_result"],
         "assessments.csv": ["id_assessment", "code_module", "code_presentation", "weight", "date"],
@@ -244,6 +257,19 @@ def _validate_oulad_schema(source_path):
 def load_and_preprocess(filepath: str, target_col: str = "G3", at_risk_threshold: float = 10,
                         expected_n_columns: int = 33, dataset_type: str = "auto"):
     """Load either the raw UCI Student Performance CSV or raw OULAD data.
+
+    Parameters
+    ----------
+    filepath : str
+        UCI: path to student-mat.csv/student-por.csv.
+        OULAD: path to the extracted OULAD directory containing the raw CSV files.
+    dataset_type : {"auto", "uci", "oulad"}
+        Explicitly select the dataset family.  The GUI uses an explicit choice;
+        ``auto`` is retained for backwards compatibility.
+
+    Returns
+    -------
+    X, y, feature_names, feature_groups, protected_attributes, groups
     """
     import os
     lower = str(filepath).lower()
@@ -333,7 +359,8 @@ def group_train_test_split(X, y, groups, test_frac=0.25, seed=0):
 def fairness_report(y_true, y_pred, protected_attributes):
     """Group fairness diagnostics. Positive class is At Risk (1).
     Reports accuracy, precision, recall/TPR, FPR and positive prediction rate
-    per protected group plus max/min gaps."""
+    per protected group plus max/min gaps. These are descriptive prototype
+    diagnostics, not claims of statistical fairness."""
     rows = []
     if not protected_attributes:
         return pd.DataFrame(rows)

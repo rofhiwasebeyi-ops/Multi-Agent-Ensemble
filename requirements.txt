@@ -1,7 +1,12 @@
 # Install with:
 #   pip install -r requirements.txt
 #
-# Requires Python >= 3.9 (no version-specific syntax beyond that is used).
+# tkinter (for the GUI) is part of the Python standard library and is NOT
+# installed via pip. On Windows/macOS python.org installers it's included
+# by default. On Debian/Ubuntu, if `python3 -c "import tkinter"` fails:
+#   sudo apt install python3-tk
+#
+# Requires Python >= 3.9
 
 numpy==2.4.4
 pandas==3.0.2

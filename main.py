@@ -2,6 +2,19 @@
 
 With no arguments: tries to launch the Tkinter GUI, falling back to a
 headless console demo on synthetic data if no display is available.
+
+For a reproducible, scriptable run against real data (no GUI at all -
+useful for producing the actual numbers that go in a paper, or for
+running on a machine with no display), use:
+
+    python main.py --dataset oulad --path /path/to/extracted/oulad
+    python main.py --dataset uci --path /path/to/student-mat.csv
+
+Run `python main.py --help` for the full set of options. Every headless
+data run writes a JSON manifest (full config + results) and, when the
+dataset provides protected attributes, a fairness_report.csv, to
+--output-dir - so a specific run's numbers can always be traced back to
+exactly what config produced them.
 """
 import argparse
 import json
@@ -13,6 +26,7 @@ from shared import (
     accuracy, confusion_matrix, precision_recall_f1,
     make_synthetic_dataset, train_test_split, group_train_test_split,
     load_and_preprocess, fairness_report, ExplainabilityEngine, save_model,
+    agreement_report, interpret_agreement,
 )
 from sklearn_pipeline import run_sklearn_single, run_sklearn_ensemble_pipeline, SKLEARN_AGENT_REGISTRY
 from gui import UserInterface
@@ -128,6 +142,9 @@ def _build_arg_parser():
                     help="Seed for the train/test split, so a run can be exactly reproduced.")
     p.add_argument("--auto-tune-mlp", action="store_true")
     p.add_argument("--auto-tune-rf", action="store_true")
+    p.add_argument("--auto-tune-all", action="store_true",
+                    help="CV-tune EVERY agent's hyperparameters before training (both pipelines): "
+                         "LogisticRegression, SVM, RandomForest, MLP and AIS. Slower; opt-in.")
     p.add_argument("--heterogeneous-agents", action="store_true",
                     help="Give LogisticRegression/RandomForest/SVM/AIS restricted, specialized "
                          "feature views (academic, behaviour, engagement, academic+behaviour "
@@ -150,7 +167,11 @@ def _build_arg_parser():
 
 def run_headless_dataset(args):
     """Reproducible, scriptable equivalent of clicking 'Run Analysis' in the
-    GUI against real data."""
+    GUI against real data - same underlying calls (load_and_preprocess,
+    group_train_test_split/train_test_split, MASController or a single
+    agent, fairness_report), but from the command line, with every setting
+    and result recorded to a JSON manifest instead of only ever existing as
+    numbers in a GUI window."""
     if not args.path:
         raise SystemExit(f"--path is required when --dataset={args.dataset} is given.")
 
@@ -181,13 +202,17 @@ def run_headless_dataset(args):
             result = run_sklearn_ensemble_pipeline(X_train, y_train, X_test, y_test,
                                                      feature_names=feature_names,
                                                      n_estimators=args.n_estimators,
-                                                     random_state=args.seed)
+                                                     random_state=args.seed,
+                                                     tune=args.auto_tune_all)
             y_pred = result["y_pred"]
             predict_fn = result["predict_proba"]
             model_name = result["model_name"]
             fitted_model = result["model"]
             extra = {"per_agent_test_acc": result["per_agent_test_acc"],
-                     "fusion_weights": result["fusion_weights"]}
+                     "fusion_weights": result["fusion_weights"],
+                     "tuned_configs": result.get("best_configs"),
+                     "agreement": agreement_report(result["agent_names"], result["agent_test_pred"],
+                                                   y_test, y_pred, result["agent_test_proba"])}
         else:
             if args.agent not in SKLEARN_AGENT_REGISTRY:
                 raise SystemExit(f"--agent={args.agent!r} is not in SKLEARN_AGENT_REGISTRY. "
@@ -204,7 +229,7 @@ def run_headless_dataset(args):
         if args.heterogeneous_agents:
             # CLI always trains on the FULL feature matrix (no --feature-set
             # subsetting like the GUI has), so feature_groups' indices are
-            # already correct positions within X_train.
+            # already correct positions within X_train - no remapping needed.
             academic_idx = feature_groups.get("academic_idx", [])
             behaviour_idx = feature_groups.get("behaviour_idx", [])
             engagement_idx = feature_groups.get("engagement_idx", [])
@@ -214,7 +239,10 @@ def run_headless_dataset(args):
                 if behaviour_idx: agent_feature_overrides["RandomForest"] = behaviour_idx
                 if engagement_idx: agent_feature_overrides["SVM"] = engagement_idx
                 # MLP stays holistic (full feature view); AIS gets the
-                # combined academic+behaviour view 
+                # combined academic+behaviour view - see FromScratchAdapter/
+                # AGENT_REGISTRY["AIS"] and AISAgent._detect_self_class for
+                # why that specific subset needed its own fix (an inverted
+                # self/non-self separation direction).
                 ais_idx = sorted(set(academic_idx + behaviour_idx))
                 if ais_idx and len(ais_idx) < X.shape[1]:
                     agent_feature_overrides["AIS"] = ais_idx
@@ -227,6 +255,7 @@ def run_headless_dataset(args):
                                     fusion_type=args.fusion,
                                     auto_tune_mlp=args.auto_tune_mlp,
                                     auto_tune_rf=args.auto_tune_rf,
+                                    auto_tune_all=args.auto_tune_all,
                                     agent_feature_overrides=agent_feature_overrides)
         result = controller.run_pipeline(X_train, y_train, X_test, y_test,
                                           feature_names=feature_names)
@@ -239,6 +268,10 @@ def run_headless_dataset(args):
             "fusion_weights": result["fusion_weights"],
             "best_mlp_config": result.get("best_mlp_config"),
             "best_rf_config": result.get("best_rf_config"),
+            "tuned_configs": {k: {"params": v["params"], "cv_acc": v["mean_acc"]}
+                              for k, v in (result.get("best_configs") or {}).items()},
+            "agreement": agreement_report(result["agent_names"], result["agent_test_pred"],
+                                          y_test, y_pred, result["agent_test_proba"]),
         }
     else:
         if args.agent not in AGENT_REGISTRY:
@@ -269,6 +302,14 @@ def run_headless_dataset(args):
     print(f"Time: {dt:.2f}s")
     print(f"Accuracy: {acc:.4f}   Precision: {precision:.4f}   Recall: {recall:.4f}   F1: {f1:.4f}")
     print(f"Confusion matrix: TP={tp} TN={tn} FP={fp} FN={fn}")
+    if extra.get("tuned_configs"):
+        print("Tuned hyperparameters:")
+        for k, v in extra["tuned_configs"].items():
+            print(f"  - {k}: {v['params']}  (CV acc {v.get('cv_acc', float('nan')):.4f})")
+    if "agreement" in extra:
+        print("Agent agreement:")
+        for line in interpret_agreement(extra["agreement"]):
+            print("  -", line)
 
     manifest = {
         "config": vars(args),
